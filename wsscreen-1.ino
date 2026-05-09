@@ -200,99 +200,118 @@ static void lvgl_unlock()
 }
 
 // ---------------------------------------------------------------------------
-// Demo UI
+// Dashboard UI
 // ---------------------------------------------------------------------------
-static lv_obj_t *s_touch_dot = nullptr;   // small indicator that follows touch
+static lv_obj_t *s_speed_arc   = nullptr;  // outer speed ring
+static lv_obj_t *s_rpm_label   = nullptr;  // dominant RPM number
+static lv_obj_t *s_speed_label = nullptr;  // speed number (km/h)
+static lv_obj_t *s_fuel_arc    = nullptr;  // bottom fuel indicator
 
-static void create_demo_ui()
+static void create_dash_ui()
 {
     lv_obj_t *scr = lv_screen_active();
 
-    // Dark background
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0d1b2a), 0);
+    // Near-black background
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x050a0f), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    // ---- Board name label ----
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "Waveshare ESP32-S3");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x00cfff), 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -100);
+    // ── Speed arc — outer ring, 270° sweep, gap at bottom ─────────────────
+    s_speed_arc = lv_arc_create(scr);
+    lv_obj_set_size(s_speed_arc, 450, 450);
+    lv_obj_center(s_speed_arc);
+    lv_obj_set_style_bg_opa(s_speed_arc, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_speed_arc, 0, 0);
+    lv_arc_set_bg_angles(s_speed_arc, 135, 45);  // 270° sweep clockwise; gap at bottom
+    lv_arc_set_range(s_speed_arc, 0, 240);
+    lv_arc_set_value(s_speed_arc, 0);
+    lv_obj_remove_flag(s_speed_arc, LV_OBJ_FLAG_CLICKABLE);
+    // Track (dim)
+    lv_obj_set_style_arc_color(s_speed_arc, lv_color_hex(0x141e2d), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_speed_arc, 14, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(s_speed_arc, true, LV_PART_MAIN);
+    // Fill (cyan)
+    lv_obj_set_style_arc_color(s_speed_arc, lv_color_hex(0x00cfff), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(s_speed_arc, 14, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_speed_arc, true, LV_PART_INDICATOR);
+    // Hide knob
+    lv_obj_set_style_bg_opa(s_speed_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_speed_arc, 0, LV_PART_KNOB);
 
-    lv_obj_t *sub = lv_label_create(scr);
-    lv_label_set_text(sub, "Touch AMOLED 1.43\"  466x466");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sub, lv_color_hex(0xaaccff), 0);
-    lv_obj_align(sub, LV_ALIGN_CENTER, 0, -76);
-
-    // ---- Separator line ----
-    lv_obj_t *line = lv_obj_create(scr);
-    lv_obj_set_size(line, 340, 2);
-    lv_obj_set_style_bg_color(line, lv_color_hex(0x335577), 0);
-    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(line, 0, 0);
-    lv_obj_set_style_pad_all(line, 0, 0);
-    lv_obj_align(line, LV_ALIGN_CENTER, 0, -56);
-
-    // ---- Coloured status chips ----
-    struct { const char *label; uint32_t color; int16_t x; } chips[] = {
-        { "SH8601",  0x22cc88, -110 },
-        { "QSPI",    0xff9900,  -37 },
-        { "FT3168",  0x44aaff,   37 },
-        { "LVGL 9",  0xdd44ff,  110 },
+    // Speed scale labels: 0 / 60 / 120 / 180 / 240
+    // Placed at fixed screen positions matching the arc sweep
+    struct { const char *txt; int16_t x; int16_t y; } ticks[] = {
+        { "0",   -190,  90 },
+        { "60",  -168, -90 },
+        { "120",    0, -196 },
+        { "180",  168, -90 },
+        { "240",  190,  90 },
     };
-    for (auto &c : chips) {
-        lv_obj_t *chip = lv_obj_create(scr);
-        lv_obj_set_size(chip, 60, 28);
-        lv_obj_set_style_radius(chip, 14, 0);
-        lv_obj_set_style_bg_color(chip, lv_color_hex(c.color), 0);
-        lv_obj_set_style_bg_opa(chip, 50, 0);
-        lv_obj_set_style_border_color(chip, lv_color_hex(c.color), 0);
-        lv_obj_set_style_border_width(chip, 1, 0);
-        lv_obj_set_style_pad_all(chip, 0, 0);
-        lv_obj_align(chip, LV_ALIGN_CENTER, c.x, -30);
-
-        lv_obj_t *lbl = lv_label_create(chip);
-        lv_label_set_text(lbl, c.label);
+    for (auto &t : ticks) {
+        lv_obj_t *lbl = lv_label_create(scr);
+        lv_label_set_text(lbl, t.txt);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(lbl, lv_color_hex(c.color), 0);
-        lv_obj_center(lbl);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0x2a3d50), 0);
+        lv_obj_align(lbl, LV_ALIGN_CENTER, t.x, t.y);
     }
 
-    // ---- Simple arc / spinner decoration ----
-    lv_obj_t *arc = lv_arc_create(scr);
-    lv_obj_set_size(arc, 120, 120);
-    lv_arc_set_range(arc, 0, 100);
-    lv_arc_set_value(arc, 78);
-    lv_obj_set_style_arc_color(arc, lv_color_hex(0x00cfff), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(arc, lv_color_hex(0x1a2a3a), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(arc, 8, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(arc, 8, LV_PART_MAIN);
-    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_align(arc, LV_ALIGN_CENTER, 0, 60);
+    // ── RPM — dominant, centred, largest text ──────────────────────────────
+    lv_obj_t *rpm_unit = lv_label_create(scr);
+    lv_label_set_text(rpm_unit, "RPM");
+    lv_obj_set_style_text_font(rpm_unit, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(rpm_unit, lv_color_hex(0x4a6070), 0);
+    lv_obj_align(rpm_unit, LV_ALIGN_CENTER, 0, -58);
 
-    lv_obj_t *arc_lbl = lv_label_create(arc);
-    lv_label_set_text(arc_lbl, "78%");
-    lv_obj_set_style_text_font(arc_lbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(arc_lbl, lv_color_white(), 0);
-    lv_obj_center(arc_lbl);
+    s_rpm_label = lv_label_create(scr);
+    lv_label_set_text(s_rpm_label, "0");
+    lv_obj_set_size(s_rpm_label, 240, 68);
+    lv_obj_set_style_text_font(s_rpm_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(s_rpm_label, lv_color_white(), 0);
+    lv_obj_set_style_text_align(s_rpm_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_opa(s_rpm_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_rpm_label, 0, 0);
+    lv_obj_align(s_rpm_label, LV_ALIGN_CENTER, 0, -8);
 
-    // ---- Touch dot ----
-    s_touch_dot = lv_obj_create(scr);
-    lv_obj_set_size(s_touch_dot, 20, 20);
-    lv_obj_set_style_radius(s_touch_dot, 10, 0);
-    lv_obj_set_style_bg_color(s_touch_dot, lv_color_hex(0xff4444), 0);
-    lv_obj_set_style_bg_opa(s_touch_dot, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_touch_dot, 0, 0);
-    lv_obj_add_flag(s_touch_dot, LV_OBJ_FLAG_HIDDEN);
-    // Positioned at touch location -- updated in loop()
+    // ── Speed — secondary, below RPM ──────────────────────────────────────
+    s_speed_label = lv_label_create(scr);
+    lv_label_set_text(s_speed_label, "0");
+    lv_obj_set_size(s_speed_label, 150, 40);
+    lv_obj_set_style_text_font(s_speed_label, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_speed_label, lv_color_hex(0x00cfff), 0);
+    lv_obj_set_style_text_align(s_speed_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_opa(s_speed_label, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_speed_label, 0, 0);
+    lv_obj_align(s_speed_label, LV_ALIGN_CENTER, 0, 60);
 
-    // ---- Bottom hint ----
-    lv_obj_t *hint = lv_label_create(scr);
-    lv_label_set_text(hint, "Touch anywhere");
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(hint, lv_color_hex(0x556677), 0);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_t *spd_unit = lv_label_create(scr);
+    lv_label_set_text(spd_unit, "km/h");
+    lv_obj_set_style_text_font(spd_unit, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(spd_unit, lv_color_hex(0x4a6070), 0);
+    lv_obj_align(spd_unit, LV_ALIGN_CENTER, 0, 94);
+
+    // ── Fuel arc — 90° arc at bottom, inside the speed-arc gap ────────────
+    s_fuel_arc = lv_arc_create(scr);
+    lv_obj_set_size(s_fuel_arc, 130, 130);
+    lv_obj_align(s_fuel_arc, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_opa(s_fuel_arc, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_fuel_arc, 0, 0);
+    lv_arc_set_bg_angles(s_fuel_arc, 45, 135);   // 90° centred at bottom of widget
+    lv_arc_set_range(s_fuel_arc, 0, 100);
+    lv_arc_set_value(s_fuel_arc, 75);
+    lv_obj_remove_flag(s_fuel_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_color(s_fuel_arc, lv_color_hex(0x141e2d), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_fuel_arc, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_rounded(s_fuel_arc, true, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_fuel_arc, lv_color_hex(0x44cc44), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(s_fuel_arc, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_fuel_arc, true, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_fuel_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_fuel_arc, 0, LV_PART_KNOB);
+
+    lv_obj_t *fuel_lbl = lv_label_create(s_fuel_arc);
+    lv_label_set_text(fuel_lbl, "FUEL");
+    lv_obj_set_style_text_font(fuel_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(fuel_lbl, lv_color_hex(0x4a6070), 0);
+    lv_obj_align(fuel_lbl, LV_ALIGN_CENTER, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,34 +461,58 @@ void setup()
                             LVGL_TASK_PRIORITY, nullptr,
                             ARDUINO_RUNNING_CORE);
 
-    // ---- 9. Build the demo UI ----
+    // ---- 9. Build the dashboard UI ----
     lvgl_lock();
-    create_demo_ui();
+    create_dash_ui();
     lvgl_unlock();
 
-    Serial.println("Setup complete -- running LVGL demo");
+    Serial.println("Setup complete -- running dashboard");
 }
 
 // ---------------------------------------------------------------------------
-// loop()
+// loop() — animate the dashboard gauges
 // ---------------------------------------------------------------------------
 void loop()
 {
-    // The touch-dot indicator is updated from loop() so that it works even
-    // when the LVGL task is busy rendering.  ft3168_read_touch() uses raw
-    // two-transaction I2C, same as the indev callback, so no contention.
-    // Both calls run inside lvgl_lock() to serialise LVGL object updates.
-    if (s_touch && s_touch_dot) {
+    static uint32_t last_ms  = 0;
+    static float    rpm      = 0.0f;
+    static float    rpm_dir  = 1.0f;
+    static float    fuel     = 75.0f;
+
+    uint32_t now = millis();
+    if (now - last_ms >= 33) {   // ~30 fps
+        last_ms = now;
+
+        // Sweep RPM 0 → 7000 → 0
+        rpm += rpm_dir * 70.0f;
+        if (rpm >= 7000.0f) { rpm = 7000.0f; rpm_dir = -1.0f; }
+        if (rpm <=    0.0f) { rpm =    0.0f; rpm_dir =  1.0f; }
+
+        int i_rpm   = (int)rpm;
+        int i_speed = (int)(rpm * 240.0f / 7000.0f);  // linear 0-7000 → 0-240 km/h
+
+        // Slowly drain fuel; refill when empty
+        fuel -= 0.003f;
+        if (fuel < 0.0f) fuel = 100.0f;
+        int i_fuel = (int)fuel;
+
         if (lvgl_lock(10)) {
-            int16_t x, y;
-            if (ft3168_read_touch(&x, &y)) {
-                lv_obj_remove_flag(s_touch_dot, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_pos(s_touch_dot, x - 10, y - 10);
-            } else {
-                lv_obj_add_flag(s_touch_dot, LV_OBJ_FLAG_HIDDEN);
-            }
+            // RPM (dominant)
+            lv_label_set_text_fmt(s_rpm_label, "%d", i_rpm);
+
+            // Speed arc + label
+            lv_arc_set_value(s_speed_arc, i_speed);
+            lv_label_set_text_fmt(s_speed_label, "%d", i_speed);
+
+            // Fuel arc — green → amber → red as level drops
+            lv_color_t fc = (i_fuel > 25) ? lv_color_hex(0x44cc44) :
+                            (i_fuel > 10) ? lv_color_hex(0xffaa00) :
+                                            lv_color_hex(0xff3322);
+            lv_obj_set_style_arc_color(s_fuel_arc, fc, LV_PART_INDICATOR);
+            lv_arc_set_value(s_fuel_arc, i_fuel);
+
             lvgl_unlock();
         }
     }
-    delay(16);   // ~60 Hz poll
+    delay(1);
 }

@@ -37,7 +37,7 @@ using namespace esp_panel::board;
 // ---------------------------------------------------------------------------
 // Board / display constants
 // ---------------------------------------------------------------------------
-#define LCD_WIDTH           466
+#define LCD_WIDTH           480      // SH8601/CO5300 DDRAM is 480 wide; circular aperture ~466px
 #define LCD_HEIGHT          466
 #define LCD_EN_GPIO         42      // Display enable pin -- drive HIGH before init
 // FT3168 / FT5x06 touch (I2C, not managed by Board -- see comment in custom conf)

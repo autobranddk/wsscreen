@@ -41,7 +41,7 @@
 // General parameters
 // --------------------------------------------------------------------------
 #define ESP_PANEL_BOARD_NAME    "Waveshare:ESP32-S3-Touch-AMOLED-1.43"
-#define ESP_PANEL_BOARD_WIDTH   (466)
+#define ESP_PANEL_BOARD_WIDTH   (480)  // DDRAM is 480 wide; circular aperture ~466px
 #define ESP_PANEL_BOARD_HEIGHT  (466)
 
 // --------------------------------------------------------------------------

@@ -1,0 +1,23 @@
+{
+    "_comment": "Set 'com' to the serial port for each ESP. Leave empty string to skip that target.",
+    "targets": {
+        "Screen": {
+            "com": "COM3",
+            "sketch": "C:\\Users\\jakob\\Documents\\wsscreen-1",
+            "fqbn": "esp32:esp32:esp32s3",
+            "boardOptions": "PSRAM=opi,FlashSize=16M,FlashMode=qio,PartitionScheme=app3M_fat9M_16MB,USBMode=hwcdc,CDCOnBoot=cdc"
+        },
+        "Master": {
+            "com": "COM6",
+            "sketch": "C:\\Users\\jakob\\Documents\\cluster-master",
+            "fqbn": "esp32:esp32:esp32",
+            "boardOptions": ""
+        },
+        "Sensor": {
+            "com": "",
+            "sketch": "",
+            "fqbn": "esp32:esp32:esp32",
+            "boardOptions": ""
+        }
+    }
+}

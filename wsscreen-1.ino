@@ -30,6 +30,11 @@
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"          // Raw I2C API (old driver, matches ESP32_Display_Panel)
+#include <esp_now.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
+#define CLUSTER_DEFINE_THEMES
+#include "core/cluster_types.h"
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -61,6 +66,10 @@ static Board              *s_board    = nullptr;
 static lv_display_t       *s_display  = nullptr;
 static SemaphoreHandle_t   s_lvgl_mux = nullptr;
 static TouchFT5x06        *s_touch    = nullptr;  // direct FT5x06 instance
+static volatile uint32_t   s_frame_count = 0;
+static volatile int        s_speed_target = 0;  /* rounded-to-10 target for smooth arc */
+
+/* Set by ESP-NOW theme callback; applied under lvgl_lock in loop() */
 
 // ---------------------------------------------------------------------------
 // LVGL / ESP32_Display_Panel integration
@@ -86,6 +95,7 @@ static void lvgl_flush_cb(lv_display_t *disp,
                     reinterpret_cast<const uint8_t *>(px_map),
                     -1);   // -1 = block until DMA done (portMAX_DELAY)
     lv_display_flush_ready(disp);
+    s_frame_count++;
 }
 
 /**
@@ -199,120 +209,123 @@ static void lvgl_unlock()
     xSemaphoreGiveRecursive(s_lvgl_mux);
 }
 
-// ---------------------------------------------------------------------------
-// Dashboard UI
-// ---------------------------------------------------------------------------
-static lv_obj_t *s_speed_arc   = nullptr;  // outer speed ring
-static lv_obj_t *s_rpm_label   = nullptr;  // dominant RPM number
-static lv_obj_t *s_speed_label = nullptr;  // speed number (km/h)
-static lv_obj_t *s_fuel_arc    = nullptr;  // bottom fuel indicator
 
-static void create_dash_ui()
+// ---------------------------------------------------------------------------
+// Dashboard UI (layout + theme defined in dash_ui.h)
+// ---------------------------------------------------------------------------
+#include "gauges/dash_ui.h"
+
+
+// ---------------------------------------------------------------------------
+// Speed arc smooth animation
+// Runs inside lv_timer_handler() under the LVGL mutex every 16 ms.
+// Lerps the displayed arc value toward s_speed_target (rounded to nearest 10).
+// ---------------------------------------------------------------------------
+static void speed_smooth_cb(lv_timer_t * /*t*/)
 {
-    lv_obj_t *scr = lv_screen_active();
+    static float smooth = 0.0f;
+    float target = (float)s_speed_target;
+    smooth += (target - smooth) * 0.15f;
+    int displayed = (int)(smooth + 0.5f);
+    lv_arc_set_value(s_speed_arc, displayed);
+    lv_label_set_text_fmt(s_speed_label, "%d", displayed);
+}
+// ---------------------------------------------------------------------------
+// ESP-NOW cluster network -- screen unit
+// ---------------------------------------------------------------------------
+#define PAIR_REQ_INTERVAL_MS  2000   /* ms between pair requests when unconnected */
+#define CONN_TIMEOUT_MS       5000   /* ms of silence before re-pairing           */
 
-    // Near-black background
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x050a0f), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+static bool     s_connected     = false;
+static uint8_t  s_master_mac[6] = {};
+static uint32_t s_last_gauge_ms = 0;
+static uint32_t s_last_pair_req = 0;
 
-    // ── Speed arc — outer ring, 270° sweep, gap at bottom ─────────────────
-    s_speed_arc = lv_arc_create(scr);
-    lv_obj_set_size(s_speed_arc, 450, 450);
-    lv_obj_center(s_speed_arc);
-    lv_obj_set_style_bg_opa(s_speed_arc, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_speed_arc, 0, 0);
-    lv_arc_set_bg_angles(s_speed_arc, 135, 45);  // 270° sweep clockwise; gap at bottom
-    lv_arc_set_range(s_speed_arc, 0, 240);
-    lv_arc_set_value(s_speed_arc, 0);
-    lv_obj_remove_flag(s_speed_arc, LV_OBJ_FLAG_CLICKABLE);
-    // Track (dim)
-    lv_obj_set_style_arc_color(s_speed_arc, lv_color_hex(0x141e2d), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(s_speed_arc, 14, LV_PART_MAIN);
-    lv_obj_set_style_arc_rounded(s_speed_arc, true, LV_PART_MAIN);
-    // Fill (cyan)
-    lv_obj_set_style_arc_color(s_speed_arc, lv_color_hex(0x00cfff), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(s_speed_arc, 14, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_rounded(s_speed_arc, true, LV_PART_INDICATOR);
-    // Hide knob
-    lv_obj_set_style_bg_opa(s_speed_arc, LV_OPA_TRANSP, LV_PART_KNOB);
-    lv_obj_set_style_pad_all(s_speed_arc, 0, LV_PART_KNOB);
+static const uint8_t BROADCAST_MAC[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
-    // Speed scale labels: 0 / 60 / 120 / 180 / 240
-    // Placed at fixed screen positions matching the arc sweep
-    struct { const char *txt; int16_t x; int16_t y; } ticks[] = {
-        { "0",   -190,  90 },
-        { "60",  -168, -90 },
-        { "120",    0, -196 },
-        { "180",  168, -90 },
-        { "240",  190,  90 },
-    };
-    for (auto &t : ticks) {
-        lv_obj_t *lbl = lv_label_create(scr);
-        lv_label_set_text(lbl, t.txt);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(lbl, lv_color_hex(0x2a3d50), 0);
-        lv_obj_align(lbl, LV_ALIGN_CENTER, t.x, t.y);
+static void send_pair_req(void)
+{
+    cluster_pair_req_t req = {};
+    req.magic     = CLUSTER_MAGIC;
+    req.pkt_type  = PKT_PAIR_REQ;
+    req.unit_type = UNIT_SCREEN;
+    snprintf(req.unit_id, sizeof(req.unit_id), "SCR-001");
+    esp_now_send(BROADCAST_MAC, (const uint8_t *)&req, sizeof(req));
+    Serial.println("[SCREEN] PAIR_REQ ->");
+}
+
+static void espnow_recv_cb(const esp_now_recv_info_t *info,
+                            const uint8_t *data, int len)
+{
+    if (len < 3) return;
+    uint16_t magic = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+    if (magic != CLUSTER_MAGIC) return;
+    uint8_t pkt_type = data[2];
+
+    if (pkt_type == PKT_PAIR_ACK && !s_connected) {
+        const cluster_pair_ack_t *ack = (const cluster_pair_ack_t *)data;
+        if (!ack->accepted) return;
+        memcpy(s_master_mac, info->src_addr, 6);
+        s_connected     = true;
+        s_last_gauge_ms = millis();   /* prevent immediate timeout */
+        Serial.printf("[SCREEN] Paired with master %02X:%02X:%02X:%02X:%02X:%02X\n",
+            s_master_mac[0], s_master_mac[1], s_master_mac[2],
+            s_master_mac[3], s_master_mac[4], s_master_mac[5]);
+        
+        return;
     }
 
-    // ── RPM — dominant, centred, largest text ──────────────────────────────
-    lv_obj_t *rpm_unit = lv_label_create(scr);
-    lv_label_set_text(rpm_unit, "RPM");
-    lv_obj_set_style_text_font(rpm_unit, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(rpm_unit, lv_color_hex(0x4a6070), 0);
-    lv_obj_align(rpm_unit, LV_ALIGN_CENTER, 0, -58);
+    if (pkt_type == PKT_DYNAMICS) {
+        const cluster_dynamics_pkt_t *pkt = (const cluster_dynamics_pkt_t *)data;
+        s_last_gauge_ms = millis();
+        s_speed_target = (((int)pkt->speed + 5) / 10) * 10;
+        if (lvgl_lock(10)) {
+            lv_label_set_text_fmt(s_rpm_label, "%d", (int)pkt->rpm);
+            lvgl_unlock();
+        }
+        return;
+    }
 
-    s_rpm_label = lv_label_create(scr);
-    lv_label_set_text(s_rpm_label, "0");
-    lv_obj_set_size(s_rpm_label, 240, 68);
-    lv_obj_set_style_text_font(s_rpm_label, &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(s_rpm_label, lv_color_white(), 0);
-    lv_obj_set_style_text_align(s_rpm_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_bg_opa(s_rpm_label, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_rpm_label, 0, 0);
-    lv_obj_align(s_rpm_label, LV_ALIGN_CENTER, 0, -8);
+    if (pkt_type == PKT_STATUS) {
+        const cluster_status_pkt_t *pkt = (const cluster_status_pkt_t *)data;
+        if (lvgl_lock(10)) {
+            lv_color_t fc = (pkt->fuel_pct > 25) ? lv_color_hex(0x44cc44) :
+                            (pkt->fuel_pct > 10) ? lv_color_hex(0xffaa00) :
+                                                   lv_color_hex(0xff3322);
+            lv_obj_set_style_arc_color(s_fuel_arc, fc, LV_PART_INDICATOR);
+            lv_arc_set_value(s_fuel_arc, pkt->fuel_pct);
+            lvgl_unlock();
+        }
+        return;
+    }
 
-    // ── Speed — secondary, below RPM ──────────────────────────────────────
-    s_speed_label = lv_label_create(scr);
-    lv_label_set_text(s_speed_label, "0");
-    lv_obj_set_size(s_speed_label, 150, 40);
-    lv_obj_set_style_text_font(s_speed_label, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(s_speed_label, lv_color_hex(0x00cfff), 0);
-    lv_obj_set_style_text_align(s_speed_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_bg_opa(s_speed_label, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_speed_label, 0, 0);
-    lv_obj_align(s_speed_label, LV_ALIGN_CENTER, 0, 60);
-
-    lv_obj_t *spd_unit = lv_label_create(scr);
-    lv_label_set_text(spd_unit, "km/h");
-    lv_obj_set_style_text_font(spd_unit, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(spd_unit, lv_color_hex(0x4a6070), 0);
-    lv_obj_align(spd_unit, LV_ALIGN_CENTER, 0, 94);
-
-    // ── Fuel arc — 90° arc at bottom, inside the speed-arc gap ────────────
-    s_fuel_arc = lv_arc_create(scr);
-    lv_obj_set_size(s_fuel_arc, 130, 130);
-    lv_obj_align(s_fuel_arc, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_opa(s_fuel_arc, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_fuel_arc, 0, 0);
-    lv_arc_set_bg_angles(s_fuel_arc, 45, 135);   // 90° centred at bottom of widget
-    lv_arc_set_range(s_fuel_arc, 0, 100);
-    lv_arc_set_value(s_fuel_arc, 75);
-    lv_obj_remove_flag(s_fuel_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_color(s_fuel_arc, lv_color_hex(0x141e2d), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(s_fuel_arc, 10, LV_PART_MAIN);
-    lv_obj_set_style_arc_rounded(s_fuel_arc, true, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(s_fuel_arc, lv_color_hex(0x44cc44), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(s_fuel_arc, 10, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_rounded(s_fuel_arc, true, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(s_fuel_arc, LV_OPA_TRANSP, LV_PART_KNOB);
-    lv_obj_set_style_pad_all(s_fuel_arc, 0, LV_PART_KNOB);
-
-    lv_obj_t *fuel_lbl = lv_label_create(s_fuel_arc);
-    lv_label_set_text(fuel_lbl, "FUEL");
-    lv_obj_set_style_text_font(fuel_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(fuel_lbl, lv_color_hex(0x4a6070), 0);
-    lv_obj_align(fuel_lbl, LV_ALIGN_CENTER, 0, 0);
+    /* PKT_GEAR -- reserved for future gear indicator widget */
 }
+
+static void espnow_init(void)
+{
+    WiFi.mode(WIFI_STA);
+    // NOTE: do NOT call WiFi.disconnect() -- it resets the channel to 0
+    Serial.printf("[SCREEN] MAC: %s\n", WiFi.macAddress().c_str());
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[SCREEN] ERROR: esp_now_init() failed");
+        return;
+    }
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_now_register_recv_cb(espnow_recv_cb);
+    uint8_t _ch; wifi_second_chan_t _sch; esp_wifi_get_channel(&_ch, &_sch);
+    Serial.printf("[SCREEN] WiFi channel: %d\n", _ch);
+
+    /* Register broadcast peer -- required to send PAIR_REQ */
+    esp_now_peer_info_t bcast = {};
+    memset(bcast.peer_addr, 0xFF, 6);
+    bcast.channel = 0;
+    bcast.encrypt = false;
+    esp_now_add_peer(&bcast);
+
+    Serial.println("[SCREEN] ESP-NOW ready -- broadcasting pairing request");
+}
+
 
 // ---------------------------------------------------------------------------
 // setup()
@@ -461,58 +474,59 @@ void setup()
                             LVGL_TASK_PRIORITY, nullptr,
                             ARDUINO_RUNNING_CORE);
 
-    // ---- 9. Build the dashboard UI ----
+    // ---- 9. Build the dashboard UI with default theme ----
     lvgl_lock();
+    g_theme = CLUSTER_THEMES[0];   /* default: Nightfall; master overrides on pair */
+
     create_dash_ui();
+    lv_timer_create(speed_smooth_cb, 16, NULL);
     lvgl_unlock();
 
-    Serial.println("Setup complete -- running dashboard");
+    // ---- 10. Init ESP-NOW and begin pairing with master unit ----
+    espnow_init();
+    send_pair_req();
+    s_last_pair_req = millis();
+
+    Serial.println("[SCREEN] Setup complete -- searching for master unit");
 }
 
+
 // ---------------------------------------------------------------------------
-// loop() — animate the dashboard gauges
+// loop() -- pairing heartbeat (gauge display driven by ESP-NOW recv callback)
 // ---------------------------------------------------------------------------
 void loop()
 {
-    static uint32_t last_ms  = 0;
-    static float    rpm      = 0.0f;
-    static float    rpm_dir  = 1.0f;
-    static float    fuel     = 75.0f;
-
+    static uint32_t fps_ms = 0;
     uint32_t now = millis();
-    if (now - last_ms >= 33) {   // ~30 fps
-        last_ms = now;
 
-        // Sweep RPM 0 → 7000 → 0
-        rpm += rpm_dir * 70.0f;
-        if (rpm >= 7000.0f) { rpm = 7000.0f; rpm_dir = -1.0f; }
-        if (rpm <=    0.0f) { rpm =    0.0f; rpm_dir =  1.0f; }
+    if (now - fps_ms >= 1000) {
+        uint32_t frames = s_frame_count;
+        s_frame_count   = 0;
+        fps_ms          = now;
+        Serial.printf("[FPS] %u\n", frames);
+    }
 
-        int i_rpm   = (int)rpm;
-        int i_speed = (int)(rpm * 240.0f / 7000.0f);  // linear 0-7000 → 0-240 km/h
-
-        // Slowly drain fuel; refill when empty
-        fuel -= 0.003f;
-        if (fuel < 0.0f) fuel = 100.0f;
-        int i_fuel = (int)fuel;
-
-        if (lvgl_lock(10)) {
-            // RPM (dominant)
-            lv_label_set_text_fmt(s_rpm_label, "%d", i_rpm);
-
-            // Speed arc + label
-            lv_arc_set_value(s_speed_arc, i_speed);
-            lv_label_set_text_fmt(s_speed_label, "%d", i_speed);
-
-            // Fuel arc — green → amber → red as level drops
-            lv_color_t fc = (i_fuel > 25) ? lv_color_hex(0x44cc44) :
-                            (i_fuel > 10) ? lv_color_hex(0xffaa00) :
-                                            lv_color_hex(0xff3322);
-            lv_obj_set_style_arc_color(s_fuel_arc, fc, LV_PART_INDICATOR);
-            lv_arc_set_value(s_fuel_arc, i_fuel);
-
-            lvgl_unlock();
+    if (!s_connected) {
+        /* Broadcast PAIR_REQ periodically until a master responds */
+        if (now - s_last_pair_req >= PAIR_REQ_INTERVAL_MS) {
+            s_last_pair_req = now;
+            send_pair_req();
+        }
+    } else {
+        /* Re-enter pairing if master has gone silent */
+        if (now - s_last_gauge_ms > CONN_TIMEOUT_MS) {
+            Serial.println("[SCREEN] Master timeout -- re-pairing");
+            s_connected = false;
+            esp_now_del_peer(s_master_mac);
+            /* Re-register broadcast peer for sending PAIR_REQ */
+            esp_now_peer_info_t bcast = {};
+            memset(bcast.peer_addr, 0xFF, 6);
+            bcast.channel = 0;
+            bcast.encrypt = false;
+            esp_now_add_peer(&bcast);
+            s_last_pair_req = 0;   /* trigger immediate re-pair attempt */
         }
     }
+
     delay(1);
 }
